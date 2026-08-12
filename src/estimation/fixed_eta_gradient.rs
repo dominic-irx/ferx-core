@@ -20,6 +20,7 @@
 //! free alongside its gradient. `lower[i] == upper[i]` marks a pinned coordinate:
 //! it contributes 0 and skips its finite-difference evaluation.
 
+use crate::estimation::nn_theta_gradient::NnGradPlan;
 use crate::pk::EventPkParams;
 use crate::stats::likelihood::{obs_nll_subject_from_preds, obs_nll_subject_into};
 use crate::types::*;
@@ -145,24 +146,31 @@ pub(crate) fn obs_nll_subject_grad_iov(
             obs_nll_subject_into_iov(model, subject, theta, sigma_values, eta, kappas, pk_scratch);
         let mut grad = vec![0.0f64; n];
         let h = 1e-5;
+        let nn_plan = NnGradPlan::build(model, subject, theta, n_theta);
+        let signed_theta_deriv = |i: usize, sign: f64, pk_scratch: &mut EventPkParams| -> f64 {
+            let mut theta_p = theta.to_vec();
+            let delta = sign * h * (1.0 + theta[i].abs());
+            theta_p[i] += delta;
+            let nll_p = obs_nll_subject_into_iov(
+                model,
+                subject,
+                &theta_p,
+                sigma_values,
+                eta,
+                kappas,
+                pk_scratch,
+            );
+            (nll_p - nll_base) / delta
+        };
         for i in 0..n {
             if lower[i] == upper[i] {
                 continue;
             }
             if i < n_theta {
-                let mut theta_p = theta.to_vec();
-                let delta = h * (1.0 + theta[i].abs());
-                theta_p[i] += delta;
-                let nll_p = obs_nll_subject_into_iov(
-                    model,
-                    subject,
-                    &theta_p,
-                    sigma_values,
-                    eta,
-                    kappas,
-                    pk_scratch,
-                );
-                let raw = (nll_p - nll_base) / delta;
+                if nn_plan.as_ref().is_some_and(|p| p.covers(i)) {
+                    continue;
+                }
+                let raw = signed_theta_deriv(i, 1.0, pk_scratch);
                 grad[i] = if theta_packs_log_mask[i] {
                     theta[i] * raw
                 } else {
@@ -178,6 +186,16 @@ pub(crate) fn obs_nll_subject_grad_iov(
                 );
                 grad[i] = sigma_values[k] * (nll_p - nll_base) / delta;
             }
+        }
+        if let Some(plan) = nn_plan.as_ref() {
+            plan.accumulate(
+                |i, sign| signed_theta_deriv(i, sign, pk_scratch),
+                theta,
+                theta_packs_log_mask,
+                lower,
+                upper,
+                &mut grad,
+            );
         }
         return (nll_base, grad);
     }
@@ -234,13 +252,12 @@ pub(crate) fn obs_nll_subject_grad_iov(
 
     // Theta gradient: forward-FD of the continuous prediction (one perturbed
     // prediction per theta; κ affects later occasions via carryover so the
-    // sensitivity is captured across all rows).
+    // sensitivity is captured across all rows). `[covariate_nn]` weight thetas
+    // are lifted out of this loop — see `nn_theta_gradient`.
     let h_fd = 1e-5;
-    for i in 0..n_theta {
-        if lower[i] == upper[i] {
-            continue;
-        }
-        let delta = h_fd * (1.0 + theta[i].abs());
+    let nn_plan = NnGradPlan::build(model, subject, theta, n_theta);
+    let mut signed_theta_deriv = |i: usize, sign: f64| -> f64 {
+        let delta = sign * h_fd * (1.0 + theta[i].abs());
         let mut theta_p = theta.to_vec();
         theta_p[i] += delta;
         let preds_p = crate::pk::predict_iov(model, subject, &theta_p, eta, kappas);
@@ -248,11 +265,28 @@ pub(crate) fn obs_nll_subject_grad_iov(
         for j in 0..n_obs {
             d_obs_nll += d_nll_d_f[j] * (preds_p[j] - all_preds_base[j]) / delta;
         }
+        d_obs_nll
+    };
+    for i in 0..n_theta {
+        if lower[i] == upper[i] || nn_plan.as_ref().is_some_and(|p| p.covers(i)) {
+            continue;
+        }
+        let d_obs_nll = signed_theta_deriv(i, 1.0);
         grad[i] = if theta_packs_log_mask[i] {
             theta[i] * d_obs_nll
         } else {
             d_obs_nll
         };
+    }
+    if let Some(plan) = nn_plan.as_ref() {
+        plan.accumulate(
+            &mut signed_theta_deriv,
+            theta,
+            theta_packs_log_mask,
+            lower,
+            upper,
+            &mut grad,
+        );
     }
 
     // Sigma gradient: analytical — same formula as non-IOV, summed over all obs.
@@ -331,17 +365,25 @@ pub(crate) fn obs_nll_subject_grad(
             obs_nll_subject_from_preds(model, subject, &preds_base, theta, sigma_values, eta);
         let mut grad = vec![0.0f64; n];
         let h = 1e-5;
+        let nn_plan = NnGradPlan::build(model, subject, theta, n_theta);
+        let signed_theta_deriv = |i: usize, sign: f64, pk_scratch: &mut EventPkParams| -> f64 {
+            let mut theta_p = theta.to_vec();
+            let delta = sign * h * (1.0 + theta[i].abs());
+            theta_p[i] += delta;
+            let nll_p =
+                obs_nll_subject_into(model, subject, &theta_p, sigma_values, eta, pk_scratch);
+            (nll_p - nll_base) / delta
+        };
+
         for i in 0..n {
             if lower[i] == upper[i] {
                 continue;
             }
             if i < n_theta {
-                let mut theta_p = theta.to_vec();
-                let delta = h * (1.0 + theta[i].abs());
-                theta_p[i] += delta;
-                let nll_p =
-                    obs_nll_subject_into(model, subject, &theta_p, sigma_values, eta, pk_scratch);
-                let raw = (nll_p - nll_base) / delta;
+                if nn_plan.as_ref().is_some_and(|p| p.covers(i)) {
+                    continue;
+                }
+                let raw = signed_theta_deriv(i, 1.0, pk_scratch);
                 grad[i] = if theta_packs_log_mask[i] {
                     theta[i] * raw
                 } else {
@@ -357,6 +399,16 @@ pub(crate) fn obs_nll_subject_grad(
                 // log-packing for sigma: d/d(log_sigma_k) = sigma_k * d/d(sigma_k)
                 grad[i] = sigma_values[k] * (nll_p - nll_base) / delta;
             }
+        }
+        if let Some(plan) = nn_plan.as_ref() {
+            plan.accumulate(
+                |i, sign| signed_theta_deriv(i, sign, pk_scratch),
+                theta,
+                theta_packs_log_mask,
+                lower,
+                upper,
+                &mut grad,
+            );
         }
         return (nll_base, grad);
     }
@@ -415,13 +467,16 @@ pub(crate) fn obs_nll_subject_grad(
 
     let mut grad = vec![0.0f64; n];
 
+    // `[covariate_nn]` weight thetas, when the network sees one input vector
+    // for this subject, are assembled from `n_outputs` finite differences
+    // instead of one per weight — see `nn_theta_gradient`. `None` (no NN block,
+    // or a time-varying NN input) leaves every theta to the loop below.
+    let nn_plan = NnGradPlan::build(model, subject, theta, n_theta);
+
     // Theta gradient: forward-FD of predictions, chain rule through obs_nll.
     let h_fd = 1e-5;
-    for i in 0..n_theta {
-        if lower[i] == upper[i] {
-            continue;
-        }
-        let delta = h_fd * (1.0 + theta[i].abs());
+    let signed_theta_deriv = |i: usize, sign: f64, pk_scratch: &mut EventPkParams| -> f64 {
+        let delta = sign * h_fd * (1.0 + theta[i].abs());
         let mut theta_p = theta.to_vec();
         theta_p[i] += delta;
         let preds_p =
@@ -429,16 +484,34 @@ pub(crate) fn obs_nll_subject_grad(
         // Difference on raw predictions — do NOT clip before differencing.
         // Clipping both pp and pb at 1e-12 before subtracting would produce a
         // zero difference whenever pb < 1e-12, silently zeroing the gradient.
-        let d_obs_nll: f64 = d_nll_d_f
+        d_nll_d_f
             .iter()
             .zip(preds_p.iter().zip(preds_base.iter()))
             .map(|(&dl, (&pp, &pb))| dl * (pp - pb) / delta)
-            .sum();
+            .sum()
+    };
+
+    for i in 0..n_theta {
+        if lower[i] == upper[i] || nn_plan.as_ref().is_some_and(|p| p.covers(i)) {
+            continue;
+        }
+        let d_obs_nll = signed_theta_deriv(i, 1.0, pk_scratch);
         grad[i] = if theta_packs_log_mask[i] {
             theta[i] * d_obs_nll
         } else {
             d_obs_nll
         };
+    }
+
+    if let Some(plan) = nn_plan.as_ref() {
+        plan.accumulate(
+            |i, sign| signed_theta_deriv(i, sign, pk_scratch),
+            theta,
+            theta_packs_log_mask,
+            lower,
+            upper,
+            &mut grad,
+        );
     }
 
     // Sigma gradient: analytical.
