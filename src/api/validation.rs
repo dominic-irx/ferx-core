@@ -2269,6 +2269,34 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
         }
     }
 
+    // `agq_eval_only` turns a `laplace` stage into a likelihood *evaluator* rather than an
+    // estimator, so the same terminal-stage rule as `imp_eval_only` applies: an evaluator
+    // mid-chain would report a `−2 log L` computed at parameters the next stage overwrites.
+    if options.agq_eval_only {
+        if !chain.contains(&EstimationMethod::Laplace) {
+            diags.push(
+                Diagnostic::error(
+                    "E_AGQ_EVAL_ONLY",
+                    "`agq_eval_only = true` requires a `laplace` stage — it is what evaluates \
+                     the adaptive-quadrature marginal likelihood. Add `laplace` to `methods` \
+                     (e.g. `methods = vi, laplace`), or drop `agq_eval_only`.",
+                )
+                .with_block("fit_options"),
+            );
+        } else if chain.last().copied() != Some(EstimationMethod::Laplace) {
+            diags.push(
+                Diagnostic::error(
+                    "E_AGQ_EVAL_ONLY",
+                    "method `laplace` with `agq_eval_only = true` must be the final stage of \
+                     the chain — placing the evaluator mid-chain would report a `−2 log L` \
+                     computed at parameters that the following stage then overwrites. Move \
+                     `laplace` to the end, or drop `agq_eval_only` to run it as an estimator.",
+                )
+                .with_block("fit_options"),
+            );
+        }
+    }
+
     // The trust-region outer optimizer does not thread kappas through its OFV.
     if model.n_kappa > 0 && options.optimizer == Optimizer::TrustRegion {
         diags.push(
